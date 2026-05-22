@@ -1,0 +1,19 @@
+# ESP-IDF build outputs
+build/
+managed_components/
+
+# Local/private training data and generated assets
+dataset/
+*.csv~
+
+# Private face-detection models are intentionally not open sourced.
+# Keep local copies for building, but do not commit them.
+*.espdl
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/
+.idea/

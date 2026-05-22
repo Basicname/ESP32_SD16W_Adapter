@@ -1,0 +1,46 @@
+menu "models: iray_model"
+    config FLASH_IRAY_PICO_120_160
+        bool "flash espdet_pico_120_160_inface"
+        depends on !IRAY_DETECT_MODEL_IN_SDCARD
+        default y
+
+    choice
+        prompt "default model"
+        default IRAY_PICO_120_160
+        help
+            Default iray detection model
+        config IRAY_PICO_120_160
+            bool "espdet_pico_120_160_inface"
+            depends on IRAY_DETECT_MODEL_IN_SDCARD || FLASH_IRAY_PICO_120_160
+    endchoice
+
+    config DEFAULT_IRAY_DETECT_MODEL
+        int
+        default 0 if IRAY_PICO_120_160
+
+    choice
+        prompt "model location"
+        default IRAY_DETECT_MODEL_IN_FLASH_RODATA
+        help
+            iray_detect model location
+        config IRAY_DETECT_MODEL_IN_FLASH_RODATA
+            bool "flash_rodata"
+        config IRAY_DETECT_MODEL_IN_FLASH_PARTITION
+            bool "flash_partition"
+        config IRAY_DETECT_MODEL_IN_SDCARD
+            bool "sdcard"
+    endchoice
+
+    config IRAY_DETECT_MODEL_LOCATION
+        int
+        default 0 if IRAY_DETECT_MODEL_IN_FLASH_RODATA
+        default 1 if IRAY_DETECT_MODEL_IN_FLASH_PARTITION
+        default 2 if IRAY_DETECT_MODEL_IN_SDCARD
+
+    config IRAY_DETECT_MODEL_SDCARD_DIR
+        string "iray_detect model sdcard dir"
+        default "models/s3" if IDF_TARGET_ESP32S3
+        depends on IRAY_DETECT_MODEL_IN_SDCARD
+        help
+            Directory of models relative to sdcard mount point.
+endmenu

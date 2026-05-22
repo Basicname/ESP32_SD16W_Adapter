@@ -1,0 +1,305 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>IR Face Detect</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0 }
+    body {
+      background: #0a0a0f;
+      color: #e0e0e0;
+      font-family: monospace;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      min-height: 100vh;
+      padding: 16px;
+    }
+    h1 {
+      font-size: 1.2rem;
+      letter-spacing: 2px;
+      color: #00ffcc;
+      margin-bottom: 8px;
+      text-transform: uppercase;
+    }
+    .controls {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 8px;
+      flex-wrap: wrap;
+      justify-content: center;
+    }
+    .btn {
+      background: #0d2020;
+      border: 1px solid #00ffcc44;
+      color: #00ffcc;
+      padding: 4px 12px;
+      border-radius: 3px;
+      cursor: pointer;
+      font-family: monospace;
+      font-size: .8rem;
+      transition: background .2s;
+    }
+    .btn:hover, .btn.active { background: #00ffcc22; border-color: #00ffcc }
+    .wrap { position: relative; border: 1px solid #00ffcc33; border-radius: 4px; overflow: hidden; cursor: crosshair; }
+    canvas { display: block; image-rendering: pixelated }
+    #oc { position: absolute; top: 0; left: 0; }
+    .bar {
+      height: 8px;
+      background: linear-gradient(90deg, #00f, #0ff, #0f0, #ff0, #f00);
+      border-radius: 2px;
+      margin-top: 4px;
+    }
+    .info {
+      display: flex;
+      justify-content: space-between;
+      font-size: .75rem;
+      margin-top: 4px;
+    }
+    .info span { color: #00ffcc; }
+  </style>
+</head>
+<body>
+  <h1>IRAY THERMAL FACE DETECTOR</h1>
+  <div class="controls">
+    <button class="btn" id="bFlipH">&#8660; &#x6C34;&#x5E73;</button>
+    <button class="btn" id="bFlipV">&#8661; &#x5782;&#x76F4;</button>
+    <button class="btn" id="bRot90">&#8635; &#x65CB;&#x8F6C;</button>
+    <button class="btn" id="bScale">3x &#x653E;&#x5927;</button>
+    <span id="fps" style="color:#00ffcc;font-size:.8rem;padding:4px 8px">--</span>
+    <span id="det" style="color:#00ffcc;font-size:.8rem;padding:4px 8px">0 faces</span>
+  </div>
+  <div class="wrap" id="wrap"><canvas id="c"></canvas><canvas id="oc"></canvas></div>
+  <div class="bar" id="bar"></div>
+  <div class="info" id="info"><span id="tmin">--</span><span id="tmax">--</span></div>
+
+  <script>
+    const W = 160, H = 120;
+    let scale = 3, flipH = false, flipV = false, rot = 0;
+    const wrap = document.getElementById('wrap');
+    const bar = document.getElementById('bar'), info = document.getElementById('info');
+    const c = document.getElementById('c'), oc = document.getElementById('oc');
+
+    function setSize() {
+      const sw = (rot % 180 === 0) ? W * scale : H * scale;
+      const sh = (rot % 180 === 0) ? H * scale : W * scale;
+      c.width = sw; c.height = sh; oc.width = sw; oc.height = sh;
+      wrap.style.width = sw + 'px'; wrap.style.height = sh + 'px';
+      bar.style.width = sw + 'px'; info.style.width = sw + 'px';
+    }
+    setSize();
+
+    const ctx = c.getContext('2d'), octx = oc.getContext('2d');
+    ctx.imageSmoothingEnabled = false;
+    const raw = document.createElement('canvas');
+    raw.width = W; raw.height = H;
+    const rctx = raw.getContext('2d');
+    rctx.imageSmoothingEnabled = false;
+    const id = rctx.createImageData(W, H), d = id.data;
+
+    const pR = new Uint8Array(256), pG = new Uint8Array(256), pB = new Uint8Array(256);
+    for (let i = 0; i < 256; i++) {
+      let r, g, b;
+      if (i < 64) { r = 0; g = i * 4; b = 255; }
+      else if (i < 128) { r = 0; g = 255; b = 255 - (i - 64) * 4; }
+      else if (i < 192) { r = (i - 128) * 4; g = 255; b = 0; }
+      else { r = 255; g = 255 - (i - 192) * 4; b = 0; }
+      pR[i] = r; pG[i] = g; pB[i] = b;
+    }
+
+    let fc = 0, ft = performance.now(), ws;
+    // lf: latest frame waiting to render; lf_last: last rendered frame (for click queries)
+    let lf = null, lf_last = null;
+    let boxes = [];
+    let rawMin = 0, rawMax = 0;
+    // click marker
+    let clickTemp = null, clickCanvasX = -1, clickCanvasY = -1;
+
+    document.addEventListener('visibilitychange', function() {
+      if (!document.hidden) { fc = 0; ft = performance.now(); }
+    });
+
+    function applyTransform(cx, sw, sh) {
+      cx.translate(sw / 2, sh / 2);
+      cx.rotate(rot * Math.PI / 180);
+      cx.scale(flipH ? -1 : 1, flipV ? -1 : 1);
+      cx.translate(-W * scale / 2, -H * scale / 2);
+    }
+
+    function connect() {
+      const _h = (location.hostname === 'localhost' || location.hostname === '127.0.0.1') ? '192.168.88.50' : location.hostname;
+      const _proto = (location.protocol === 'https:') ? 'wss' : 'ws';
+      ws = new WebSocket(_proto + '://' + _h + '/ws');
+      ws.binaryType = 'arraybuffer';
+      ws.onmessage = function (e) {
+        if (!(e.data instanceof ArrayBuffer) || e.data.byteLength < W * H + 1) return;
+        const buf = new Uint8Array(e.data);
+        lf = buf.slice(0, W * H);
+        const cnt = buf[W * H];
+        const bs = [];
+        for (let i = 0; i < cnt; i++) {
+          const o = W * H + 1 + i * 9;
+          if (o + 9 > buf.length) break;
+          const x1 = (buf[o] << 8 | buf[o + 1]);
+          const y1 = (buf[o + 2] << 8 | buf[o + 3]);
+          const x2 = (buf[o + 4] << 8 | buf[o + 5]);
+          const y2 = (buf[o + 6] << 8 | buf[o + 7]);
+          const sc = (buf[o + 8] / 255).toFixed(2);
+          bs.push({ x1: x1, y1: y1, x2: x2, y2: y2, sc: sc });
+        }
+        boxes = bs;
+        // parse appended raw min/max (4 bytes after box data)
+        const tail = W * H + 1 + cnt * 9;
+        if (buf.length >= tail + 4) {
+          rawMin = (buf[tail] << 8 | buf[tail + 1]);
+          rawMax = (buf[tail + 2] << 8 | buf[tail + 3]);
+          document.getElementById('tmin').textContent = (rawMin / 10.0 - 273.0).toFixed(1) + ' \u00b0C';
+          document.getElementById('tmax').textContent = (rawMax / 10.0 - 273.0).toFixed(1) + ' \u00b0C';
+        }
+      };
+      ws.onopen = function () { document.getElementById('fps').textContent = 'WS:OK'; };
+      ws.onclose = function () { document.getElementById('fps').textContent = 'closed'; setTimeout(connect, 1000); };
+      ws.onerror = function () { document.getElementById('fps').textContent = 'err'; ws.close(); };
+    }
+
+    function render() {
+      if (lf) {
+        lf_last = lf;
+        const b = lf;
+        lf = null;
+        for (let i = 0, j = 0; i < b.length; i++, j += 4) {
+          d[j] = pR[b[i]];
+          d[j + 1] = pG[b[i]];
+          d[j + 2] = pB[b[i]];
+          d[j + 3] = 255;
+        }
+        rctx.putImageData(id, 0, 0);
+        const sw = c.width, sh = c.height;
+        ctx.save();
+        ctx.clearRect(0, 0, sw, sh);
+        applyTransform(ctx, sw, sh);
+        ctx.drawImage(raw, 0, 0, W * scale, H * scale);
+        ctx.restore();
+
+        octx.clearRect(0, 0, sw, sh);
+        octx.save();
+        applyTransform(octx, sw, sh);
+        octx.lineWidth = scale;
+        for (let bi = 0; bi < boxes.length; bi++) {
+          const bx = boxes[bi];
+          octx.strokeStyle = '#00ffcc';
+          let rx1, ry1, rw, rh;
+          if (rot === 0 || rot === 180) {
+            rx1 = (rot === 0) ? bx.x1 * scale : (W - bx.x2) * scale;
+            ry1 = (rot === 0) ? bx.y1 * scale : (H - bx.y2) * scale;
+            rw  = (bx.x2 - bx.x1) * scale;
+            rh  = (bx.y2 - bx.y1) * scale;
+          } else if (rot === 90) {
+            rx1 = bx.y1 * scale;
+            ry1 = (W - bx.x2) * scale;
+            rw  = (bx.y2 - bx.y1) * scale;
+            rh  = (bx.x2 - bx.x1) * scale;
+          } else {
+            rx1 = (H - bx.y2) * scale;
+            ry1 = bx.x1 * scale;
+            rw  = (bx.y2 - bx.y1) * scale;
+            rh  = (bx.x2 - bx.x1) * scale;
+          }
+          octx.strokeRect(rx1, ry1, rw, rh);
+          octx.fillStyle = 'rgba(0,255,204,0.9)';
+          octx.fillRect(rx1, ry1 - scale * 5, scale * 28, scale * 5);
+          octx.fillStyle = '#000';
+          octx.font = (scale * 4) + 'px monospace';
+          octx.fillText(bx.sc, rx1 + scale, ry1 - scale);
+        }
+        octx.restore();
+
+        // draw click-to-temp marker in screen space (no transform)
+        if (clickTemp !== null && clickCanvasX >= 0) {
+          const mx = clickCanvasX, my = clickCanvasY;
+          octx.save();
+          octx.strokeStyle = '#ffff00';
+          octx.lineWidth = 1.5;
+          const cs = 7;
+          octx.beginPath();
+          octx.moveTo(mx - cs, my); octx.lineTo(mx + cs, my);
+          octx.moveTo(mx, my - cs); octx.lineTo(mx, my + cs);
+          octx.stroke();
+          const label = clickTemp.toFixed(1) + ' \u00b0C';
+          const fh = Math.max(12, scale * 4);
+          octx.font = 'bold ' + fh + 'px monospace';
+          const tw = octx.measureText(label).width;
+          const pad = 4;
+          let lx = mx + 10, ly = my - 6;
+          if (lx + tw + pad * 2 > oc.width) lx = mx - tw - pad * 2 - 10;
+          if (ly - fh < 0) ly = my + fh + 6;
+          octx.fillStyle = 'rgba(0,0,0,0.75)';
+          octx.fillRect(lx - pad, ly - fh, tw + pad * 2, fh + pad);
+          octx.fillStyle = '#ffff00';
+          octx.fillText(label, lx, ly);
+          octx.restore();
+        }
+
+        document.getElementById('det').textContent = boxes.length + ' face' + (boxes.length !== 1 ? 's' : '');
+        fc++;
+      }
+      const now = performance.now();
+      if (now - ft >= 1000) {
+        document.getElementById('fps').textContent = (fc * 1000 / (now - ft)).toFixed(1) + ' fps';
+        fc = 0; ft = now;
+      }
+      requestAnimationFrame(render);
+    }
+
+    // Click-to-temp: map canvas click back to raw pixel coordinate, then compute temperature
+    oc.addEventListener('click', function(e) {
+      if (rawMax === rawMin || !lf_last) return;
+      const rect = oc.getBoundingClientRect();
+      const cx = e.clientX - rect.left;
+      const cy = e.clientY - rect.top;
+      const sw = oc.width, sh = oc.height;
+      // Inverse of applyTransform
+      let px = cx - sw / 2;
+      let py = cy - sh / 2;
+      // inverse rotate
+      const rad = -rot * Math.PI / 180;
+      const rx = px * Math.cos(rad) - py * Math.sin(rad);
+      const ry = px * Math.sin(rad) + py * Math.cos(rad);
+      px = rx; py = ry;
+      // inverse flip
+      if (flipH) px = -px;
+      if (flipV) py = -py;
+      // shift back to image top-left
+      px += W * scale / 2;
+      py += H * scale / 2;
+      // unscale
+      const rawX = Math.floor(px / scale);
+      const rawY = Math.floor(py / scale);
+      if (rawX < 0 || rawX >= W || rawY < 0 || rawY >= H) {
+        clickTemp = null;
+        return;
+      }
+      clickCanvasX = cx;
+      clickCanvasY = cy;
+      // linearly interpolate: index 0->rawMin, 255->rawMax
+      const idx = lf_last[rawY * W + rawX];
+      const rawVal = rawMin + (rawMax - rawMin) * idx / 255.0;
+      clickTemp = rawVal / 10.0 - 273.0;
+    });
+
+    document.getElementById('bFlipH').onclick = function () { flipH = !flipH; this.classList.toggle('active'); };
+    document.getElementById('bFlipV').onclick = function () { flipV = !flipV; this.classList.toggle('active'); };
+    document.getElementById('bRot90').onclick = function () { rot = (rot + 90) % 360; setSize(); clickTemp = null; };
+    document.getElementById('bScale').onclick = function () {
+      const ss = [1, 2, 3, 4];
+      scale = ss[(ss.indexOf(scale) + 1) % ss.length];
+      this.textContent = scale + 'x \u653e\u5927';
+      setSize();
+    };
+
+    connect();
+    render();
+  </script>
+</body>
+</html>

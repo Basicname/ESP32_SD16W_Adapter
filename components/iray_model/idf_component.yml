@@ -1,0 +1,6 @@
+version: "0.1.0"
+license: "MIT"
+description: ESP-DL wrapper for the private SD16W thermal detection model.
+dependencies:
+  espressif/esp-dl:
+    version: ">=3.1.3"
