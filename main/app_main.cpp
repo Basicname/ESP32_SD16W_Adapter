@@ -14,7 +14,9 @@
 #include "freertos/task.h"
 #include "iray_detect.hpp"
 #include "nvs_flash.h"
+#include "lwip/ip4_addr.h"
 #include <math.h>
+#include <stdint.h>
 #include <string.h>
 
 static const char *TAG = "iray_scanner";
@@ -22,6 +24,14 @@ static const char *TAG = "iray_scanner";
 #define WIFI_SSID "iray_scanner_ap"
 #define WIFI_PASS "iray1234"
 #define WIFI_MAX_RETRY 10
+#define WIFI_STATIC_IP_0 192
+#define WIFI_STATIC_IP_1 168
+#define WIFI_STATIC_IP_2 88
+#define WIFI_STATIC_IP_3 50
+#define WIFI_GATEWAY_0 192
+#define WIFI_GATEWAY_1 168
+#define WIFI_GATEWAY_2 88
+#define WIFI_GATEWAY_3 1
 
 #define PIN_UART_TX 17
 #define PIN_UART_RX 16
@@ -39,14 +49,16 @@ static const char *TAG = "iray_scanner";
 #define PACKETS_PER_FRAME 121
 #define SPI_BURST_BYTES (PACKET_BYTES * PACKETS_PER_FRAME)
 #define SPI_HOST_DEV SPI2_HOST
-#define SPI_CLOCK_HZ (20 * 1000 * 1000)
-#define INT_DEBOUNCE_US 50000
+#define SPI_CLOCK_HZ (40 * 1000 * 1000)
+#define INT_DEBOUNCE_US 5000
 #define SPI_DMA_CHUNK 4092
+#define DETECT_EVERY_N_FRAMES 1
+#define FRAME_WAIT_TIMEOUT_MS 200
 
 #define MAX_BOXES 10
 #define BOX_BYTES 9
-// +4 bytes for appended raw min/max (2 bytes each)
-#define WS_BUF_SIZE (FRAME_PIXELS + 1 + MAX_BOXES * BOX_BYTES + 4)
+// +4 bytes for appended raw min/max, +4 bytes frame id for verification.
+#define WS_BUF_SIZE (FRAME_PIXELS + 1 + MAX_BOXES * BOX_BYTES + 8)
 
 static uint8_t s_spi_buf[SPI_BURST_BYTES] __attribute__((aligned(4)))
 EXT_RAM_BSS_ATTR;
@@ -61,12 +73,20 @@ static TaskHandle_t s_scanner_task = NULL;
 static float s_min_c = 0, s_max_c = 0;
 static uint32_t s_frame_count = 0;
 static uint16_t s_raw_min = 0, s_raw_max = 0;
+static uint32_t s_capture_us = 0, s_process_us = 0, s_detect_us = 0;
+static uint32_t s_ws_queued = 0, s_ws_skipped = 0;
+static uint32_t s_wait_timeouts = 0, s_wait_level_hits = 0;
+static uint32_t s_drop_count = 0, s_wait_low_timeouts = 0;
+static volatile uint32_t s_irq_period_us = 0;
+static volatile uint32_t s_irq_period_min_us = UINT32_MAX;
+static volatile uint32_t s_irq_period_max_us = 0;
 
 static EventGroupHandle_t s_wifi_eg;
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT BIT1
 static int s_wifi_retry = 0;
 static bool s_wifi_ok = false;
+static esp_netif_t *s_wifi_netif = NULL;
 
 static httpd_handle_t s_server = NULL;
 
@@ -74,14 +94,39 @@ static httpd_handle_t s_server = NULL;
 static int s_ws_fds[MAX_WS_CLIENTS];
 static int s_ws_count = 0;
 static SemaphoreHandle_t s_ws_mux = NULL;
+static SemaphoreHandle_t s_box_mux = NULL;
 
 static IRayDetect *s_detector = nullptr;
+static TaskHandle_t s_detect_task = NULL;
+
+typedef struct {
+  int16_t x1;
+  int16_t y1;
+  int16_t x2;
+  int16_t y2;
+  uint8_t score;
+} box_cache_t;
+
+static box_cache_t s_last_boxes[MAX_BOXES];
+static uint8_t s_last_box_count = 0;
+static uint32_t s_last_detect_frame = 0;
+static uint32_t s_detect_runs = 0, s_detect_skipped = 0;
+static volatile bool s_detect_busy = false;
+static uint8_t s_detect_frame[FRAME_PIXELS] EXT_RAM_BSS_ATTR;
 
 static void IRAM_ATTR spi_int_isr(void *arg) {
   (void)arg;
   uint32_t now = (uint32_t)esp_timer_get_time();
-  if ((now - s_last_int_us) < INT_DEBOUNCE_US)
+  uint32_t delta = now - s_last_int_us;
+  if (s_last_int_us != 0 && delta < INT_DEBOUNCE_US)
     return;
+  if (s_last_int_us != 0) {
+    s_irq_period_us = delta;
+    if (delta < s_irq_period_min_us)
+      s_irq_period_min_us = delta;
+    if (delta > s_irq_period_max_us)
+      s_irq_period_max_us = delta;
+  }
   s_last_int_us = now;
   s_irq_count = s_irq_count + 1;
   BaseType_t woken = pdFALSE;
@@ -146,6 +191,7 @@ static void sd16w_init(void) {
 }
 
 static spi_device_handle_t s_spi_dev;
+static int s_spi_actual_khz = 0;
 static void spi_init(void) {
   spi_bus_config_t b = {};
   b.miso_io_num = PIN_SPI_MISO;
@@ -162,12 +208,26 @@ static void spi_init(void) {
   d.queue_size = 1;
   d.flags = 0;
   ESP_ERROR_CHECK(spi_bus_add_device(SPI_HOST_DEV, &d, &s_spi_dev));
-  ESP_LOGI(TAG, "SPI @ %d MHz", SPI_CLOCK_HZ / 1000000);
+  ESP_ERROR_CHECK(spi_device_get_actual_freq(s_spi_dev, &s_spi_actual_khz));
+  ESP_LOGI(TAG, "SPI request=%d MHz actual=%.3f MHz", SPI_CLOCK_HZ / 1000000,
+           (double)s_spi_actual_khz / 1000.0);
 }
 
 static spi_transaction_t s_spi_t;
 
+static bool wait_for_frame_ready(void) {
+  if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(FRAME_WAIT_TIMEOUT_MS)) > 0)
+    return true;
+  s_wait_timeouts++;
+  return false;
+}
+
+static void wait_for_frame_not_ready(void) {
+  (void)0;
+}
+
 static bool capture_frame(void) {
+  int64_t t0 = esp_timer_get_time();
   size_t received = 0;
   while (received < SPI_BURST_BYTES) {
     size_t chunk = SPI_BURST_BYTES - received;
@@ -182,6 +242,8 @@ static bool capture_frame(void) {
     received += chunk;
     esp_task_wdt_reset();
   }
+  s_capture_us = (uint32_t)(esp_timer_get_time() - t0);
+  int64_t t1 = esp_timer_get_time();
   taskYIELD();
   uint8_t seen[FRAME_HEIGHT] = {0};
   uint16_t valid = 0;
@@ -249,6 +311,7 @@ static bool capture_frame(void) {
   s_raw_max = maxV;
   s_min_c = (float)minV / 10.0f - 273.0f;
   s_max_c = (float)maxV / 10.0f - 273.0f;
+  s_process_us = (uint32_t)(esp_timer_get_time() - t1);
   return true;
 }
 
@@ -281,36 +344,20 @@ static void index_to_rgb565be(const uint8_t *idx, uint16_t *out, int n) {
 static size_t build_ws_payload(void) {
   uint8_t *buf = s_ws_bufs[s_ws_buf_idx];
   memcpy(buf, s_index_frame, FRAME_PIXELS);
-  uint8_t *tail;
-  if (!s_detector) {
-    buf[FRAME_PIXELS] = 0;
-    tail = buf + FRAME_PIXELS + 1;
-    // append raw min/max (big-endian uint16) for JS click-to-temp
-    tail[0] = (uint8_t)(s_raw_min >> 8);
-    tail[1] = (uint8_t)(s_raw_min & 0xFF);
-    tail[2] = (uint8_t)(s_raw_max >> 8);
-    tail[3] = (uint8_t)(s_raw_max & 0xFF);
-    return FRAME_PIXELS + 1 + 4;
+
+  box_cache_t boxes[MAX_BOXES];
+  uint8_t cnt = 0;
+  if (s_box_mux && xSemaphoreTake(s_box_mux, pdMS_TO_TICKS(1)) == pdTRUE) {
+    cnt = s_last_box_count;
+    memcpy(boxes, s_last_boxes, cnt * sizeof(box_cache_t));
+    xSemaphoreGive(s_box_mux);
   }
-  static uint16_t rgb_buf[FRAME_PIXELS];
-  index_to_rgb565be(s_index_frame, rgb_buf, FRAME_PIXELS);
-  dl::image::img_t img;
-  img.data = rgb_buf;
-  img.width = FRAME_WIDTH;
-  img.height = FRAME_HEIGHT;
-  img.pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB565;
-  auto &results = s_detector->run(img);
-  taskYIELD();
-  uint8_t cnt =
-      (uint8_t)(results.size() > MAX_BOXES ? MAX_BOXES : results.size());
   buf[FRAME_PIXELS] = cnt;
   uint8_t *p = buf + FRAME_PIXELS + 1;
-  auto it = results.begin();
-  for (int i = 0; i < cnt; i++, ++it) {
-    const auto &res = *it;
-    int16_t bx1 = (int16_t)res.box[0], by1 = (int16_t)res.box[1];
-    int16_t bx2 = (int16_t)res.box[2], by2 = (int16_t)res.box[3];
-    uint8_t sc = (uint8_t)(res.score * 255.0f);
+  for (int i = 0; i < cnt; i++) {
+    int16_t bx1 = boxes[i].x1, by1 = boxes[i].y1;
+    int16_t bx2 = boxes[i].x2, by2 = boxes[i].y2;
+    uint8_t sc = boxes[i].score;
     p[0] = (uint8_t)(bx1 >> 8);
     p[1] = (uint8_t)(bx1 & 0xFF);
     p[2] = (uint8_t)(by1 >> 8);
@@ -321,15 +368,31 @@ static size_t build_ws_payload(void) {
     p[7] = (uint8_t)(by2 & 0xFF);
     p[8] = sc;
     p += BOX_BYTES;
-    ESP_LOGI(TAG, "Face score=%.2f [%d,%d,%d,%d]", res.score, bx1, by1, bx2,
-             by2);
   }
   // append raw min/max (big-endian uint16) for JS click-to-temp
   p[0] = (uint8_t)(s_raw_min >> 8);
   p[1] = (uint8_t)(s_raw_min & 0xFF);
   p[2] = (uint8_t)(s_raw_max >> 8);
   p[3] = (uint8_t)(s_raw_max & 0xFF);
-  return (size_t)(FRAME_PIXELS + 1 + cnt * BOX_BYTES + 4);
+  p[4] = (uint8_t)(s_frame_count >> 24);
+  p[5] = (uint8_t)(s_frame_count >> 16);
+  p[6] = (uint8_t)(s_frame_count >> 8);
+  p[7] = (uint8_t)(s_frame_count & 0xFF);
+  return (size_t)(FRAME_PIXELS + 1 + cnt * BOX_BYTES + 8);
+}
+
+static void submit_detection_frame(void) {
+  if (!s_detector || !s_detect_task)
+    return;
+  if ((s_frame_count % DETECT_EVERY_N_FRAMES) != 0)
+    return;
+  if (s_detect_busy) {
+    s_detect_skipped++;
+    return;
+  }
+  memcpy(s_detect_frame, s_index_frame, FRAME_PIXELS);
+  s_detect_busy = true;
+  xTaskNotifyGive(s_detect_task);
 }
 
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id,
@@ -337,6 +400,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id,
   if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
     esp_wifi_connect();
   } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+    s_wifi_ok = false;
+    xEventGroupClearBits(s_wifi_eg, WIFI_CONNECTED_BIT);
     if (s_wifi_retry < WIFI_MAX_RETRY) {
       esp_wifi_connect();
       s_wifi_retry++;
@@ -357,7 +422,15 @@ static void wifi_init(void) {
   s_wifi_eg = xEventGroupCreate();
   ESP_ERROR_CHECK(esp_netif_init());
   ESP_ERROR_CHECK(esp_event_loop_create_default());
-  esp_netif_create_default_wifi_sta();
+  s_wifi_netif = esp_netif_create_default_wifi_sta();
+  ESP_ERROR_CHECK(esp_netif_dhcpc_stop(s_wifi_netif));
+  esp_netif_ip_info_t ip = {};
+  IP4_ADDR(&ip.ip, WIFI_STATIC_IP_0, WIFI_STATIC_IP_1, WIFI_STATIC_IP_2,
+           WIFI_STATIC_IP_3);
+  IP4_ADDR(&ip.gw, WIFI_GATEWAY_0, WIFI_GATEWAY_1, WIFI_GATEWAY_2,
+           WIFI_GATEWAY_3);
+  IP4_ADDR(&ip.netmask, 255, 255, 255, 0);
+  ESP_ERROR_CHECK(esp_netif_set_ip_info(s_wifi_netif, &ip));
   wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
   ESP_ERROR_CHECK(esp_wifi_init(&cfg));
   esp_event_handler_instance_t h1, h2;
@@ -416,8 +489,10 @@ static void ws_send_cb(void *arg) {
 static void ws_broadcast(size_t payload_len) {
   if (!s_server || s_ws_count == 0)
     return;
-  if (s_ws_sending)
+  if (s_ws_sending) {
+    s_ws_skipped++;
     return;
+  }
   int fd;
   xSemaphoreTake(s_ws_mux, portMAX_DELAY);
   fd = (s_ws_count > 0) ? s_ws_fds[0] : -1;
@@ -433,7 +508,10 @@ static void ws_broadcast(size_t payload_len) {
   esp_err_t r = httpd_queue_work(s_server, ws_send_cb, NULL);
   if (r != ESP_OK) {
     s_ws_sending = false;
+    s_ws_skipped++;
     ESP_LOGW(TAG, "queue_work fail err=%d", r);
+  } else {
+    s_ws_queued++;
   }
 }
 
@@ -462,9 +540,30 @@ static esp_err_t http_root_handler(httpd_req_t *req) {
 }
 
 static esp_err_t http_stats_handler(httpd_req_t *req) {
-  char buf[128];
-  snprintf(buf, sizeof(buf), "{\"frames\":%lu,\"min_c\":%.1f,\"max_c\":%.1f}",
-           (unsigned long)s_frame_count, s_min_c, s_max_c);
+  char buf[512];
+  uint32_t irq_min =
+      (s_irq_period_min_us == UINT32_MAX) ? 0 : s_irq_period_min_us;
+  snprintf(buf, sizeof(buf),
+           "{\"frames\":%lu,\"min_c\":%.1f,\"max_c\":%.1f,"
+           "\"capture_us\":%lu,\"process_us\":%lu,\"detect_us\":%lu,"
+           "\"detect_runs\":%lu,\"detect_skipped\":%lu,"
+           "\"ws_queued\":%lu,\"ws_skipped\":%lu,\"detect_interval\":%d,"
+           "\"irq\":%lu,\"irq_period_us\":%lu,"
+           "\"irq_period_min_us\":%lu,\"irq_period_max_us\":%lu,"
+           "\"wait_timeouts\":%lu,\"wait_level_hits\":%lu,"
+           "\"drops\":%lu,\"wait_low_timeouts\":%lu,"
+           "\"spi_requested_hz\":%d,\"spi_actual_khz\":%d}",
+           (unsigned long)s_frame_count, s_min_c, s_max_c,
+           (unsigned long)s_capture_us, (unsigned long)s_process_us,
+           (unsigned long)s_detect_us, (unsigned long)s_detect_runs,
+           (unsigned long)s_detect_skipped, (unsigned long)s_ws_queued,
+           (unsigned long)s_ws_skipped, DETECT_EVERY_N_FRAMES,
+           (unsigned long)s_irq_count, (unsigned long)s_irq_period_us,
+           (unsigned long)irq_min, (unsigned long)s_irq_period_max_us,
+           (unsigned long)s_wait_timeouts, (unsigned long)s_wait_level_hits,
+           (unsigned long)s_drop_count,
+           (unsigned long)s_wait_low_timeouts, SPI_CLOCK_HZ,
+           s_spi_actual_khz);
   httpd_resp_set_type(req, "application/json");
   return httpd_resp_send(req, buf, HTTPD_RESP_USE_STRLEN);
 }
@@ -522,16 +621,23 @@ static void scanner_task(void *arg) {
   (void)arg;
   esp_task_wdt_add(NULL);
   s_scanner_task = xTaskGetCurrentTaskHandle();
-  uint32_t drop = 0, last_log = 0;
+  uint32_t drop = 0, wait_miss = 0, last_log = 0;
   while (1) {
     esp_task_wdt_reset();
-    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(200));
+    if (!wait_for_frame_ready()) {
+      wait_miss++;
+      continue;
+    }
     if (!capture_frame()) {
       drop++;
+      s_drop_count = drop;
+      wait_for_frame_not_ready();
       continue;
     }
     s_frame_count++;
+    wait_for_frame_not_ready();
     ulTaskNotifyTake(pdTRUE, 0);
+    submit_detection_frame();
     if (s_wifi_ok) {
       size_t plen = build_ws_payload();
       ws_broadcast(plen);
@@ -541,11 +647,49 @@ static void scanner_task(void *arg) {
       last_log = now;
       ESP_LOGI(
           TAG,
-          "[Status] frames=%lu drop=%lu irq=%lu T=%.1f~%.1fC ws=%d heap=%lu",
+          "[Status] frames=%lu drop=%lu wait=%lu irq=%lu T=%.1f~%.1fC ws=%d heap=%lu",
           (unsigned long)s_frame_count, (unsigned long)drop,
-          (unsigned long)s_irq_count, s_min_c, s_max_c, s_ws_count,
+          (unsigned long)wait_miss, (unsigned long)s_irq_count, s_min_c,
+          s_max_c, s_ws_count,
           (unsigned long)heap_caps_get_free_size(MALLOC_CAP_DMA));
     }
+  }
+}
+
+static void detect_task(void *arg) {
+  (void)arg;
+  static uint16_t rgb_buf[FRAME_PIXELS];
+  while (1) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    int64_t td0 = esp_timer_get_time();
+    index_to_rgb565be(s_detect_frame, rgb_buf, FRAME_PIXELS);
+    dl::image::img_t img;
+    img.data = rgb_buf;
+    img.width = FRAME_WIDTH;
+    img.height = FRAME_HEIGHT;
+    img.pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB565;
+    auto &results = s_detector->run(img);
+    box_cache_t boxes[MAX_BOXES];
+    uint8_t cnt =
+        (uint8_t)(results.size() > MAX_BOXES ? MAX_BOXES : results.size());
+    auto it = results.begin();
+    for (int i = 0; i < cnt; i++, ++it) {
+      const auto &res = *it;
+      boxes[i].x1 = (int16_t)res.box[0];
+      boxes[i].y1 = (int16_t)res.box[1];
+      boxes[i].x2 = (int16_t)res.box[2];
+      boxes[i].y2 = (int16_t)res.box[3];
+      boxes[i].score = (uint8_t)(res.score * 255.0f);
+    }
+    if (s_box_mux && xSemaphoreTake(s_box_mux, portMAX_DELAY) == pdTRUE) {
+      memcpy(s_last_boxes, boxes, cnt * sizeof(box_cache_t));
+      s_last_box_count = cnt;
+      s_last_detect_frame = s_frame_count;
+      xSemaphoreGive(s_box_mux);
+    }
+    s_detect_runs++;
+    s_detect_us = (uint32_t)(esp_timer_get_time() - td0);
+    s_detect_busy = false;
   }
 }
 
@@ -566,10 +710,11 @@ extern "C" void app_main(void) {
   sd16w_init();
   wifi_init();
   s_ws_mux = xSemaphoreCreateMutex();
-  if (s_wifi_ok) {
-    start_server();
-  }
-  s_detector = new IRayDetect();
+  s_box_mux = xSemaphoreCreateMutex();
+  start_server();
+  s_detector = new IRayDetect(IRayDetect::IRAY_PICO_120_160, false);
+  xTaskCreatePinnedToCore(detect_task, "detect", 8192, NULL, 1, &s_detect_task,
+                          0);
   xTaskCreatePinnedToCore(scanner_task, "scanner", 8192, NULL, 5, NULL, 1);
   ESP_LOGI(TAG, "Scanner task started");
 }
